@@ -3,6 +3,7 @@ import argparse
 import base64
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -52,6 +53,12 @@ def run_git(cmd: List[str], env: Dict[str, str], cwd: Optional[Path] = None) -> 
     if r.returncode != 0:
         raise RuntimeError(f"git failed ({' '.join(cmd)}):\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
 
+def is_git_repo(path: Path, env: Dict[str, str]) -> bool:
+    if not path.exists():
+        return False
+    r = subprocess.run(["git", "rev-parse", "--is-bare-repository"], cwd=str(path), env=env, capture_output=True, text=True)
+    return r.returncode == 0
+
 def create_askpass_helper(pat: str) -> (str, Dict[str, str]):
     """
     Creates a temporary askpass script that supplies a dummy username and the PAT as the password.
@@ -85,6 +92,7 @@ def main():
     ap.add_argument("--pat", help="Azure DevOps Personal Access Token (or set AZDO_PAT env var)")
     ap.add_argument("--out", default="dc", help="Output root folder (default: dc)")
     ap.add_argument("--update", action="store_true", help="If repo folder exists, run 'git fetch --all --prune' and 'git pull --ff-only'")
+    ap.add_argument("--bare", action="store_true", help="Clone repositories as bare repos to avoid Windows invalid-path checkout failures")
     ap.add_argument("--projects-include", nargs="*", help="Optional: only include these project names")
     ap.add_argument("--projects-exclude", nargs="*", help="Optional: exclude these project names")
     ap.add_argument("--verbose", action="store_true")
@@ -142,14 +150,17 @@ def main():
                         print(f"    URL: {clone_url}")
 
                     if target_dir.exists():
-                        if (target_dir / ".git").exists():
+                        if is_git_repo(target_dir, git_env):
                             if args.update:
                                 if args.verbose:
-                                    print("    Exists -> updating (fetch + pull)...")
-                                # safer updates
+                                    print("    Exists -> updating (fetch + prune)...")
                                 run_git(["git", "fetch", "--all", "--prune"], git_env, cwd=target_dir)
-                                # Pull default branch only; if unknown, 'git pull' uses current branch.
-                                run_git(["git", "pull", "--ff-only"], git_env, cwd=target_dir)
+                                if not args.bare:
+                                    # Pull default branch only; if unknown, 'git pull' uses current branch.
+                                    run_git(["git", "pull", "--ff-only"], git_env, cwd=target_dir)
+                                else:
+                                    if args.verbose:
+                                        print("    Bare repo -> fetch only (no working tree to pull).")
                             else:
                                 if args.verbose:
                                     print("    Exists -> skip (use --update to pull).")
@@ -161,7 +172,23 @@ def main():
                     # clone fresh
                     if args.verbose:
                         print("    Cloning...")
-                    run_git(["git", "clone", "--origin", "origin", clone_url, str(target_dir)], git_env)
+                    clone_cmd = ["git", "clone", "--origin", "origin"]
+                    if args.bare:
+                        clone_cmd.append("--bare")
+                    clone_cmd.extend([clone_url, str(target_dir)])
+
+                    try:
+                        run_git(clone_cmd, git_env)
+                    except RuntimeError as exc:
+                        message = str(exc).lower()
+                        if not args.bare and ("checkout failed" in message or "invalid path" in message):
+                            print("    WARNING: Clone succeeded but checkout failed due to invalid Windows paths. Retrying as bare clone.")
+                            if target_dir.exists():
+                                shutil.rmtree(target_dir)
+                            run_git(["git", "clone", "--bare", "--origin", "origin", clone_url, str(target_dir)], git_env)
+                        else:
+                            raise
+
                     if args.verbose:
                         print(f"    -> {target_dir} ✓")
 
